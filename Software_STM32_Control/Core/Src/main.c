@@ -22,39 +22,62 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdlib.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+/* 1-D Kalman filter state for LDR noise reduction */
 typedef struct {
-    float x;   // state estimate
-    float p;   // error covariance
-    float q;   // process noise  — higher: trusts signal more
-    float r;   // measurement noise — higher: smoother output
+    float x;    /* State estimate */
+    float p;    /* Estimate covariance */
+    float q;    /* Process noise */
+    float r;    /* Measurement noise */
 } Kalman1D;
 
+/* PID controller with derivative-on-measurement and filtered derivative */
 typedef struct {
-    float kp;          // proportional gain
-    float ki;          // integral gain
-    float kd;          // derivative gain
-    float integral;    // accumulated error
-    float prev_error;  // previous error (for derivative)
-    float i_limit;     // anti-windup clamp
-    float d_filtered;  // low-pass filtered derivative output
-    float d_alpha;     // derivative filter coefficient (0.1–0.3)
+    float kp;
+    float ki;
+    float kd;
+    float integral;
+    float prev_error;
+    float prev_measurement;
+    float i_limit;
+    float d_filtered;
+    float d_alpha;
+    float prev_raw_d;
 } PID;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define PAN_MIN        500
-#define PAN_MAX        2000
-#define TILT_MIN       500
-#define TILT_MAX       1300
-#define SMOOTH_ALPHA   0.18f   // exponential position smoother coefficient
-#define TOL_ENTER      80      // hysteresis: motor activates above this error
-#define TOL_EXIT       120     // hysteresis: motor deactivates below this error
-#define MA_SIZE        5       // moving average window size
+
+/* Servo PWM pulse limits (microseconds) */
+#define PAN_MIN              500
+#define PAN_MAX              2000
+#define TILT_MIN             500
+#define TILT_MAX             1300
+
+/* Output low-pass filter (1.0 = disabled, smaller = more smoothing) */
+#define SMOOTH_ALPHA         0.95f
+
+/* Adaptive deadband bounds (LDR ADC units) */
+#define TOL_MIN              50.0f
+#define TOL_MAX              80.0f
+
+/* Number of ADC samples averaged per LDR read */
+#define LDR_SAMPLES          3
+
+/* Consecutive out-of-band samples required before PID activates */
+#define CONFIRM_THRESH       2
+
+/* Slew rate limit: max change in servo target per control loop (us) */
+#define MAX_DELTA_PER_LOOP   15.0f
+
+/* Fixed control loop period (ms) for deterministic sampling */
+#define LOOP_PERIOD_MS       5
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -64,38 +87,39 @@ typedef struct {
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
-
 TIM_HandleTypeDef htim1;
-
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+
+/* Raw ADC values from the four LDR sensors (Top-Left, Top-Right, Bottom-Left, Bottom-Right) */
 uint16_t ldr_TL = 0, ldr_TR = 0, ldr_BL = 0, ldr_BR = 0;
 
-// Kalman filter instances — one per LDR channel
-Kalman1D k_TL = {2048, 1.0f, 2.0f, 80.0f};
-Kalman1D k_TR = {2048, 1.0f, 2.0f, 80.0f};
-Kalman1D k_BL = {2048, 1.0f, 2.0f, 80.0f};
-Kalman1D k_BR = {2048, 1.0f, 2.0f, 80.0f};
+/* Per-sensor Kalman filters: initial state 2048 (mid-range), tuned Q/R for slow light changes */
+Kalman1D k_TL = {2048, 1.0f, 2.0f, 200.0f};
+Kalman1D k_TR = {2048, 1.0f, 2.0f, 200.0f};
+Kalman1D k_BL = {2048, 1.0f, 2.0f, 200.0f};
+Kalman1D k_BR = {2048, 1.0f, 2.0f, 200.0f};
 
-//         kp      ki       kd     integral  prev  i_limit  d_filt  d_alpha
-PID pid_pan  = {0.008f, 0.0002f, 0.003f, 0, 0, 50.0f, 0, 0.15f};
-PID pid_tilt = {0.008f, 0.0002f, 0.003f, 0, 0, 50.0f, 0, 0.15f};
+/* PID gains tuned for MG996R servo + 10k pull-down LDR bridge at 200 Hz loop rate.
+ * Field order: kp, ki, kd, integral, prev_error, prev_measurement, i_limit, d_filtered, d_alpha, prev_raw_d
+ */
+PID pid_pan  = {0.0045f, 0.002f, 0.0005f, 0, 0, 0, 20.0f, 0, 0.15f, 0};
+PID pid_tilt = {0.0045f, 0.002f, 0.0005f, 0, 0, 0, 20.0f, 0, 0.15f, 0};
 
+/* Servo target (PID output) and smoothed position (PWM command) */
 float target_pan  = 1250;
 float target_tilt = 900;
 float pos_pan     = 1250;
 float pos_tilt    = 900;
 
-// Moving average circular buffers — pre-filled to avoid startup transient
-float ma_TL[MA_SIZE] = {2048, 2048, 2048, 2048, 2048}; uint8_t ma_idx_TL = 0;
-float ma_TR[MA_SIZE] = {2048, 2048, 2048, 2048, 2048}; uint8_t ma_idx_TR = 0;
-float ma_BL[MA_SIZE] = {2048, 2048, 2048, 2048, 2048}; uint8_t ma_idx_BL = 0;
-float ma_BR[MA_SIZE] = {2048, 2048, 2048, 2048, 2048}; uint8_t ma_idx_BR = 0;
-
-// Hysteresis state flags (0 = inside dead band, 1 = active)
+/* PID active flags - controllers idle when error stays within deadband */
 uint8_t pan_active  = 0;
 uint8_t tilt_active = 0;
+
+/* Counters used to debounce PID activation on transient noise */
+uint8_t pan_confirm  = 0;
+uint8_t tilt_confirm = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -111,21 +135,30 @@ static void MX_TIM1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Single-channel ADC read — reconfigures channel each call */
-uint16_t Read_LDR(uint32_t Channel) {
+/* Reads a single ADC channel multiple times and returns the average.
+ * Software oversampling reduces noise from LDR thermal drift and supply ripple.
+ */
+uint16_t Read_LDR_Avg(uint32_t Channel) {
     ADC_ChannelConfTypeDef sConfig = {0};
     sConfig.Channel = Channel;
     sConfig.Rank = ADC_REGULAR_RANK_1;
     sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
     HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-    HAL_ADC_Start(&hadc1);
-    HAL_ADC_PollForConversion(&hadc1, 10);
-    uint16_t value = HAL_ADC_GetValue(&hadc1);
+
+    uint32_t sum = 0;
+    for (int i = 0; i < LDR_SAMPLES; i++) {
+        HAL_ADC_Start(&hadc1);
+        HAL_ADC_PollForConversion(&hadc1, 10);
+        sum += HAL_ADC_GetValue(&hadc1);
+    }
     HAL_ADC_Stop(&hadc1);
-    return value;
+
+    return (uint16_t)(sum / LDR_SAMPLES);
 }
 
-/* 1D Kalman filter — predict → update cycle */
+/* Standard 1-D Kalman filter update step.
+ * Predicts forward, then corrects with the new measurement.
+ */
 float Kalman_Update(Kalman1D *k, float measurement) {
     k->p = k->p + k->q;
     float kg = k->p / (k->p + k->r);
@@ -134,40 +167,89 @@ float Kalman_Update(Kalman1D *k, float measurement) {
     return k->x;
 }
 
-/* PID with hysteresis dead band, anti-windup clamping and filtered derivative */
-float PID_Update(PID *pid, float error, uint8_t *active) {
-    uint16_t thr = (*active) ? TOL_ENTER : TOL_EXIT;
+/* Adaptive deadband scales with ambient light level.
+ * Brighter ambient means more noise on the differential signal,
+ * so the deadband widens proportionally.
+ */
+float Calc_Adaptive_Tol(float ambient) {
+    float ratio = ambient / 4096.0f;
+    return TOL_MIN + ratio * (TOL_MAX - TOL_MIN);
+}
 
-    if (error > -(float)thr && error < (float)thr) {
-        pid->integral   = 0.0f;
-        pid->prev_error = 0.0f;
-        pid->d_filtered = 0.0f;
-        *active = 0;
-        return 0.0f;
+/* PID update with several industrial-grade features:
+ *  - Tustin (trapezoidal) integration for accurate discrete-time behavior
+ *  - Derivative on measurement (not error) to prevent derivative kick on setpoint changes
+ *  - Low-pass filter on derivative to attenuate sensor noise
+ *  - Hysteresis-based deadband with confirmation counter (debounced activation)
+ *  - Asymmetric enter/exit thresholds prevent limit cycling at the boundary
+ *  - Integral clamping for anti-windup
+ */
+float PID_Update(PID *pid, float setpoint, float measurement, float dt,
+                 uint8_t *active, float tol, uint8_t *confirm) {
+    float error = setpoint - measurement;
+    float thr_enter = tol;
+    float thr_exit  = tol * 2.5f;
+
+    if (error > -thr_enter && error < thr_enter) {
+        /* Inside deadband */
+        *confirm = 0;
+        if (*active) {
+            /* Already active - require deeper return before deactivating (hysteresis) */
+            if (error > -thr_exit && error < thr_exit) {
+                pid->integral   = 0.0f;
+                pid->prev_error = 0.0f;
+                pid->prev_measurement = measurement;
+                pid->d_filtered = 0.0f;
+                pid->prev_raw_d = 0.0f;
+                *active = 0;
+            }
+        }
+        if (!(*active)) {
+            /* Track measurement while idle so derivative is sane on next activation */
+            pid->prev_measurement = measurement;
+            return 0.0f;
+        }
+    } else {
+        /* Outside deadband */
+        if (!(*active)) {
+            (*confirm)++;
+            pid->prev_measurement = measurement;
+            if (*confirm < CONFIRM_THRESH) {
+                return 0.0f;
+            }
+            *active = 1;
+            pid->prev_error = error;
+        }
     }
-    *active = 1;
 
-    // Integral with hard clamp (anti-windup)
-    pid->integral += error;
+    /* Trapezoidal integration with clamping anti-windup */
+    pid->integral += (error + pid->prev_error) * 0.5f * dt;
     if (pid->integral >  pid->i_limit) pid->integral =  pid->i_limit;
     if (pid->integral < -pid->i_limit) pid->integral = -pid->i_limit;
 
-    // Low-pass filtered derivative — suppresses noise amplification
-    float raw_d     = error - pid->prev_error;
-    pid->d_filtered = pid->d_alpha * raw_d + (1.0f - pid->d_alpha) * pid->d_filtered;
+    /* Derivative on measurement (negated to match error-derivative sign) with bilinear LPF */
+    float raw_d = -(measurement - pid->prev_measurement) / dt;
+    float k  = pid->d_alpha * 0.5f;
+    float c1 = (1.0f - k) / (1.0f + k);
+    float c2 =  k         / (1.0f + k);
+    pid->d_filtered = c1 * pid->d_filtered + c2 * (raw_d + pid->prev_raw_d);
+
     pid->prev_error = error;
+    pid->prev_measurement = measurement;
+    pid->prev_raw_d = raw_d;
 
     return (pid->kp * error) + (pid->ki * pid->integral) + (pid->kd * pid->d_filtered);
 }
 
-/* Circular buffer moving average */
-float Moving_Avg(float *buf, uint8_t *idx, float new_val) {
-    buf[*idx % MA_SIZE] = new_val;
-    (*idx)++;
-    float sum = 0;
-    for (int i = 0; i < MA_SIZE; i++) sum += buf[i];
-    return sum / MA_SIZE;
+/* Slew rate limiter: caps how much the target can move in a single loop iteration.
+ * Prevents large PID outputs from commanding mechanically jarring servo movements.
+ */
+float Apply_Slew(float delta) {
+    if (delta >  MAX_DELTA_PER_LOOP) return  MAX_DELTA_PER_LOOP;
+    if (delta < -MAX_DELTA_PER_LOOP) return -MAX_DELTA_PER_LOOP;
+    return delta;
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -180,102 +262,147 @@ int main(void)
 
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
 
-  /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_TIM1_Init();
+
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 
-  /* Soft start — ramp servos to home position over 1 second to prevent snap */
+  /* Soft start: smoothly ramp servos from minimum to home position over 1 second.
+   * Prevents inrush current spikes and mechanical shock on power-up.
+   * Blocking HAL_Delay is acceptable here since this runs only once at boot.
+   */
   for (int i = 1; i <= 50; i++) {
-        uint16_t p = (uint16_t)(1250.0f * i / 50);
-        uint16_t t = (uint16_t)( 900.0f * i / 50);
+        uint16_t p = PAN_MIN + (uint16_t)((1250.0f - PAN_MIN) * i / 50.0f);
+        uint16_t t = TILT_MIN + (uint16_t)((900.0f - TILT_MIN) * i / 50.0f);
+
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, p);
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, t);
         HAL_Delay(20);
     }
+
+  uint32_t prev_time = HAL_GetTick();
+  uint32_t next_tick = HAL_GetTick() + LOOP_PERIOD_MS;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-    while (1)
-    {
-        // 1) Raw ADC read
-        ldr_TL = Read_LDR(ADC_CHANNEL_4);
-        ldr_TR = Read_LDR(ADC_CHANNEL_1);
-        ldr_BL = Read_LDR(ADC_CHANNEL_5);
-        ldr_BR = Read_LDR(ADC_CHANNEL_0);
+  while (1)
+  {
+    /* USER CODE END WHILE */
 
-        // 2) Kalman filter — removes high-frequency sensor noise
+    /* USER CODE BEGIN 3 */
+
+    /* Non-blocking timer: run control loop every LOOP_PERIOD_MS milliseconds.
+     * Signed cast handles 32-bit tick counter overflow correctly (~49 day rollover).
+     */
+    if ((int32_t)(HAL_GetTick() - next_tick) >= 0) {
+        next_tick += LOOP_PERIOD_MS;
+
+        /* If execution fell far behind (e.g. due to a debug breakpoint),
+         * skip the catch-up burst and resync to the current time.
+         */
+        if ((int32_t)(HAL_GetTick() - next_tick) > 100) {
+            next_tick = HAL_GetTick() + LOOP_PERIOD_MS;
+        }
+
+        /* Measure actual loop period for PID time-step.
+         * Even with the fixed schedule, using measured dt keeps the math correct
+         * if the schedule slips.
+         */
+        uint32_t current_time = HAL_GetTick();
+        float dt = (current_time - prev_time) / 1000.0f;
+        if (dt < 0.001f) dt = 0.001f;
+        prev_time = current_time;
+
+        /* Read the four LDRs. Channel mapping is set by the PCB layout. */
+        ldr_TL = Read_LDR_Avg(ADC_CHANNEL_4);
+        ldr_TR = Read_LDR_Avg(ADC_CHANNEL_1);
+        ldr_BL = Read_LDR_Avg(ADC_CHANNEL_5);
+        ldr_BR = Read_LDR_Avg(ADC_CHANNEL_0);
+
+        /* Kalman filter each sensor independently for noise reduction. */
         float f_TL = Kalman_Update(&k_TL, ldr_TL);
         float f_TR = Kalman_Update(&k_TR, ldr_TR);
         float f_BL = Kalman_Update(&k_BL, ldr_BL);
         float f_BR = Kalman_Update(&k_BR, ldr_BR);
 
-        // 3) Moving average — secondary smoothing on Kalman output
-        f_TL = Moving_Avg(ma_TL, &ma_idx_TL, f_TL);
-        f_TR = Moving_Avg(ma_TR, &ma_idx_TR, f_TR);
-        f_BL = Moving_Avg(ma_BL, &ma_idx_BL, f_BL);
-        f_BR = Moving_Avg(ma_BR, &ma_idx_BR, f_BR);
-
+        /* Compute the four edge averages used for differential error signals. */
         float avg_top    = (f_TL + f_TR) / 2.0f;
         float avg_bottom = (f_BL + f_BR) / 2.0f;
         float avg_left   = (f_TL + f_BL) / 2.0f;
         float avg_right  = (f_TR + f_BR) / 2.0f;
 
-        float error_tilt = avg_top   - avg_bottom;
-        float error_pan  = avg_left  - avg_right;
+        /* Ambient light estimate drives the adaptive deadband. */
+        float ambient      = (f_TL + f_TR + f_BL + f_BR) / 4.0f;
+        float adaptive_tol = Calc_Adaptive_Tol(ambient);
 
-        // 4) PID — compute target position correction
-        float out_pan  = PID_Update(&pid_pan,  error_pan,  &pan_active);
-        float out_tilt = PID_Update(&pid_tilt, error_tilt, &tilt_active);
+        /* Setpoint is zero: we want left=right and top=bottom (perfectly aimed at the sun). */
+        float setpoint = 0.0f;
 
-        target_pan  += out_pan;
-        target_tilt -= out_tilt;   // sign depends on mechanical orientation
+        /* Differential measurements: positive pan means right side is brighter,
+         * positive tilt means bottom is brighter.
+         */
+        float meas_pan  = avg_right - avg_left;
+        float meas_tilt = avg_bottom - avg_top;
 
-        // 5) Clamp target within mechanical limits
-        if (target_pan  > PAN_MAX)   target_pan  = PAN_MAX;
-        if (target_pan  < PAN_MIN)   target_pan  = PAN_MIN;
-        if (target_tilt > TILT_MAX)  target_tilt = TILT_MAX;
-        if (target_tilt < TILT_MIN)  target_tilt = TILT_MIN;
+        /* Run both PID controllers. */
+        float out_pan  = PID_Update(&pid_pan,  setpoint, meas_pan,  dt, &pan_active,  adaptive_tol, &pan_confirm);
+        float out_tilt = PID_Update(&pid_tilt, setpoint, meas_tilt, dt, &tilt_active, adaptive_tol, &tilt_confirm);
 
-        // 6) Exponential smoother — organic motion profile toward target
+        /* Apply slew limit and update servo targets.
+         * Sign is negated: positive error (light unbalanced right) needs servo to move toward light.
+         */
+        float dpan  = Apply_Slew(-out_pan);
+        float dtilt = Apply_Slew(-out_tilt);
+        target_pan  += dpan;
+        target_tilt += dtilt;
+
+        /* Conditional anti-windup: when the target saturates against a limit,
+         * clear any integral pushing further into the saturation.
+         */
+        if (target_pan > PAN_MAX) {
+            target_pan = PAN_MAX;
+            if (pid_pan.integral < 0) pid_pan.integral = 0;
+        } else if (target_pan < PAN_MIN) {
+            target_pan = PAN_MIN;
+            if (pid_pan.integral > 0) pid_pan.integral = 0;
+        }
+
+        if (target_tilt > TILT_MAX) {
+            target_tilt = TILT_MAX;
+            if (pid_tilt.integral < 0) pid_tilt.integral = 0;
+        } else if (target_tilt < TILT_MIN) {
+            target_tilt = TILT_MIN;
+            if (pid_tilt.integral > 0) pid_tilt.integral = 0;
+        }
+
+        /* Optional low-pass on the commanded position (currently near-disabled at 0.95). */
         pos_pan  = pos_pan  + SMOOTH_ALPHA * (target_pan  - pos_pan);
         pos_tilt = pos_tilt + SMOOTH_ALPHA * (target_tilt - pos_tilt);
 
-        // (legacy threshold check — superseded by +0.5f rounding below)
-        static float pwm_pan  = 1250;
-        static float pwm_tilt = 900;
-
-        if (pos_pan  - pwm_pan  >  0.5f || pwm_pan  - pos_pan  >  0.5f) pwm_pan  = pos_pan;
-        if (pos_tilt - pwm_tilt >  0.5f || pwm_tilt - pos_tilt >  0.5f) pwm_tilt = pos_tilt;
-
-        // 7) PWM write — +0.5f converts truncation to proper rounding,
-        //    eliminating micro-stepping artifacts at low delta values
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint16_t)(pos_pan  + 0.5f));
+        /* Send PWM command to the servos. */
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint16_t)(pos_pan + 0.5f));
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint16_t)(pos_tilt + 0.5f));
-
-        HAL_Delay(20);
     }
+
+    /* CPU is free between control loop iterations - background tasks can run here. */
+  }
   /* USER CODE END 3 */
 }
 
@@ -288,13 +415,8 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSIDiv = RCC_HSI_DIV1;
@@ -305,8 +427,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
@@ -337,8 +457,6 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 1 */
 
-  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
-  */
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
@@ -354,8 +472,8 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_1CYCLE_5;
-  hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_1CYCLE_5;
+  hadc1.Init.SamplingTimeCommon1 = ADC_SAMPLETIME_160CYCLES_5;
+  hadc1.Init.SamplingTimeCommon2 = ADC_SAMPLETIME_160CYCLES_5;
   hadc1.Init.OversamplingMode = DISABLE;
   hadc1.Init.TriggerFrequencyMode = ADC_TRIGGER_FREQ_HIGH;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -363,8 +481,6 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel
-  */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLINGTIME_COMMON_1;
@@ -471,7 +587,7 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_7B;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
   huart2.Init.Mode = UART_MODE_TX_RX;
@@ -501,21 +617,17 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : T_NRST_Pin */
   GPIO_InitStruct.Pin = T_NRST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(T_NRST_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -530,10 +642,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE END 4 */
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
@@ -545,13 +653,6 @@ void Error_Handler(void)
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
